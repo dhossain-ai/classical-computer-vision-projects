@@ -1,116 +1,170 @@
+"""
+main.py
+-------
+Entry point for SIFT-based wand detection.
+
+Usage
+-----
+    python src/main.py
+    python src/main.py --data data
+    python src/main.py --ratio 0.78
+    python src/main.py --min-match 3
+
+Output
+------
+    output/wand_detection_result.png
+"""
+
 import argparse
-from pathlib import Path
+import os
+import sys
 
-import cv2
+# Allow running as `python src/main.py` from the project root
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from .matcher import MatchConfig, detect_template_instances
-from .utils import (
-    build_match_visualization,
-    draw_instances,
-    draw_title,
-    ensure_output_dir,
-    load_image,
-    save_image,
+from src.matcher import (
+    build_sift,
+    build_flann,
+    build_template_mask,
+    enhance_template,
+    compute_keypoints,
+    lowe_ratio_match,
+    cluster_matches,
+)
+from src.utils import (
+    load_bgr,
+    to_gray,
+    enhance_contrast,
+    build_figure,
+    print_summary,
 )
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Match an object between two images using SIFT.",
+        description="Detect and count wands in Harry Potter scenes using SIFT."
     )
     parser.add_argument(
-        "--template",
-        type=str,
-        default="data/hp_wand.png",
-        help="Path to template image",
-    )
-    parser.add_argument(
-        "--scene",
-        type=str,
-        default="data/hp_scene1.jpg",
-        help="Path to scene image",
+        "--data",
+        default="data",
+        help="Folder with images",
     )
     parser.add_argument(
         "--output",
-        type=str,
-        default="output/hp_scene1_detected.jpg",
-        help="Path to save annotated scene image",
+        default="output",
+        help="Folder for results",
     )
     parser.add_argument(
-        "--matches-output",
-        type=str,
-        default="output/hp_scene1_matches.jpg",
-        help="Path to save keypoint match visualization",
+        "--wand",
+        default="hp_wand.png",
+        help="Reference wand filename inside --data",
     )
     parser.add_argument(
-        "--show",
-        action="store_true",
-        help="Show output windows",
+        "--scenes",
+        nargs="+",
+        default=[
+            "hp_scene1.jpg",
+            "hp_scene2.jpg",
+            "hp_scene3.jpg",
+            "hp_scene4.jpg",
+        ],
+        help="Scene filenames inside --data",
+    )
+    parser.add_argument(
+        "--ratio",
+        type=float,
+        default=0.78,
+        help="Lowe ratio threshold",
+    )
+    parser.add_argument(
+        "--min-match",
+        type=int,
+        default=3,
+        help="Minimum good matches required to attempt clustering",
     )
     return parser.parse_args()
 
 
 def main() -> None:
-    args = parse_arguments()
+    args = parse_args()
 
-    template_path = Path(args.template)
-    scene_path = Path(args.scene)
-    output_path = Path(args.output)
-    matches_output_path = Path(args.matches_output)
+    os.makedirs(args.output, exist_ok=True)
 
-    ensure_output_dir(output_path)
-    ensure_output_dir(matches_output_path)
+    sift = build_sift()
+    flann = build_flann()
 
-    template_image = load_image(template_path, unchanged=True)
-    scene_image = load_image(scene_path)
+    wand_path = os.path.join(args.data, args.wand)
+    wand_bgr = load_bgr(wand_path)
+    wand_gray = enhance_contrast(to_gray(wand_bgr))
 
-    config = MatchConfig()
-    instances, template_keypoints, scene_keypoints = detect_template_instances(
-        template_image,
-        scene_image,
-        config,
+    wand_mask = build_template_mask(wand_gray)
+    wand_gray = enhance_template(wand_gray, wand_mask)
+
+    kp_wand, des_wand = compute_keypoints(sift, wand_gray, mask=wand_mask)
+    print(f"[INFO] Reference wand : {wand_path}  ({len(kp_wand)} keypoints)")
+
+    scene_results = []
+
+    for filename in args.scenes:
+        path = os.path.join(args.data, filename)
+        name = os.path.splitext(filename)[0]
+
+        try:
+            scene_bgr = load_bgr(path)
+        except FileNotFoundError as error:
+            print(f"[WARN] {error} — skipping.")
+            continue
+
+        scene_gray = enhance_contrast(to_gray(scene_bgr))
+        kp_scene, des_scene = compute_keypoints(sift, scene_gray)
+
+        good = lowe_ratio_match(flann, des_wand, des_scene, ratio=args.ratio)
+
+        count, centers = cluster_matches(
+            good,
+            kp_scene,
+            scene_bgr.shape,
+            min_match=args.min_match,
+        )
+
+        match_pts = (
+            [kp_scene[m.trainIdx].pt for m in good]
+            if len(good) >= args.min_match
+            else []
+        )
+
+        print(
+            f"[INFO] {name:<20}  kp={len(kp_scene):<6} "
+            f"matches={len(good):<4}  wands={count}"
+        )
+
+        scene_results.append(
+            {
+                "title": name,
+                "bgr": scene_bgr,
+                "kp_scene": kp_scene,
+                "good": good,
+                "match_pts": match_pts,
+                "centers": centers,
+                "count": count,
+            }
+        )
+
+    if not scene_results:
+        print("[ERROR] No scenes processed. Check your --data folder.")
+        sys.exit(1)
+
+    print_summary(scene_results)
+
+    fig = build_figure(wand_bgr, kp_wand, scene_results)
+    out_path = os.path.join(args.output, "wand_detection_result.png")
+    fig.savefig(
+        out_path,
+        dpi=140,
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
     )
-
-    annotated_scene = draw_instances(scene_image, instances)
-    annotated_scene = draw_title(annotated_scene, f"Detected wand count: {len(instances)}")
-
-    best_instance = max(instances, key=lambda item: item.inlier_count, default=None)
-    match_visualization = build_match_visualization(
-        template_image,
-        scene_image,
-        template_keypoints,
-        scene_keypoints,
-        best_instance,
-    )
-
-    save_image(output_path, annotated_scene)
-
-    if match_visualization is not None:
-        save_image(matches_output_path, match_visualization)
-
-    print(f"Template image: {template_path}")
-    print(f"Scene image: {scene_path}")
-    print(f"Detected wand count: {len(instances)}")
-
-    if instances:
-        for index, instance in enumerate(instances, start=1):
-            print(
-                f"Instance {index}: good_matches={instance.good_match_count}, "
-                f"inliers={instance.inlier_count}, bbox={instance.bbox}"
-            )
-    else:
-        print("No strong wand instance was detected.")
-
-    print(f"Annotated scene saved to: {output_path}")
-    if match_visualization is not None:
-        print(f"Match visualization saved to: {matches_output_path}")
-
-    if args.show:
-        cv2.imshow("Detected Wand Instances", annotated_scene)
-        if match_visualization is not None:
-            cv2.imshow("Best Match Visualization", match_visualization)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+    print(f"\n[INFO] Result saved -> {out_path}")
 
 
 if __name__ == "__main__":
